@@ -1203,8 +1203,8 @@ if __name__ == "__main__":
     logger.info("🤖 Iniciando Spanish Learning Telegram Bot con selección de nivel")
     logger.info("=" * 60)
     logger.info(f"Niveles disponibles:")
-    for level, config in LEVEL_CONFIGS.items():
-        logger.info(f"  - {level}: {config['description']} (velocidad: {int(config['speaking_rate']*100)}%, voz: {config['wavenet_voice']})")
+    for level, level_config in LEVEL_CONFIGS.items():
+        logger.info(f"  - {level}: {level_config['description']} (velocidad: {int(level_config['speaking_rate']*100)}%, voz: {level_config['wavenet_voice']})")
     logger.info(f"Límite de tasa: {config.RATE_LIMIT_REQUESTS} solicitudes por {config.RATE_LIMIT_WINDOW}s")
     logger.info("=" * 60)
     
