@@ -8,7 +8,7 @@ import random
 from datetime import datetime
 from collections import defaultdict
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
 from openai import OpenAI
 from google.cloud import texttospeech
 from google.oauth2 import service_account
@@ -37,6 +37,9 @@ if not DEEPSEEK_API_KEY:
     raise ValueError("Missing DEEPSEEK_API_KEY in environment variables")
 if not GOOGLE_CREDENTIALS_JSON:
     raise ValueError("Missing GOOGLE_CREDENTIALS_JSON in environment variables")
+
+# Conversation states
+TOPIC, LEVEL = range(2)
 
 class Config:
     MAX_TOPIC_LENGTH = 100
@@ -83,6 +86,70 @@ rate_limiter = RateLimiter(
     window=config.RATE_LIMIT_WINDOW
 )
 
+# Level configurations
+LEVEL_CONFIGS = {
+    "B1": {
+        "description": "Intermediate",
+        "speaking_rate": 0.85,
+        "wavenet_voice": "es-ES-Wavenet-B",
+        "chirp_voices": [
+            "es-ES-Chirp-HD-F",
+            "es-ES-Chirp-HD-O",
+            "es-ES-Chirp3-HD-Gacrux",
+            "es-US-Chirp3-HD-Leda",
+            "es-ES-Chirp3-HD-Algenib",
+            "es-ES-Chirp3-HD-Charon",
+            "es-US-Chirp3-HD-Algieba"
+        ],
+        "prompt_modifier": "SOLID B1 level. Use vocabulary that is clearly B1, avoiding anything that might be borderline A2/B1. "
+    },
+    "B2": {
+        "description": "Upper Intermediate",
+        "speaking_rate": 0.80,
+        "wavenet_voice": "es-ES-Wavenet-C",
+        "chirp_voices": [
+            "es-ES-Chirp-HD-F",
+            "es-ES-Chirp-HD-O",
+            "es-ES-Chirp3-HD-Gacrux",
+            "es-US-Chirp3-HD-Leda",
+            "es-ES-Chirp3-HD-Algenib",
+            "es-ES-Chirp3-HD-Charon",
+            "es-US-Chirp3-HD-Algieba"
+        ],
+        "prompt_modifier": "B2 level. Use vocabulary appropriate for upper-intermediate learners."
+    },
+    "C1": {
+        "description": "Advanced",
+        "speaking_rate": 0.75,
+        "wavenet_voice": "es-ES-Wavenet-D",
+        "chirp_voices": [
+            "es-ES-Chirp-HD-F",
+            "es-ES-Chirp-HD-O",
+            "es-ES-Chirp3-HD-Gacrux",
+            "es-US-Chirp3-HD-Leda",
+            "es-ES-Chirp3-HD-Algenib",
+            "es-ES-Chirp3-HD-Charon",
+            "es-US-Chirp3-HD-Algieba"
+        ],
+        "prompt_modifier": "C1 level. Use advanced vocabulary and complex sentence structures."
+    },
+    "C2": {
+        "description": "Proficient",
+        "speaking_rate": 0.75,
+        "wavenet_voice": "es-ES-Wavenet-E",
+        "chirp_voices": [
+            "es-ES-Chirp-HD-F",
+            "es-ES-Chirp-HD-O",
+            "es-ES-Chirp3-HD-Gacrux",
+            "es-US-Chirp3-HD-Leda",
+            "es-ES-Chirp3-HD-Algenib",
+            "es-ES-Chirp3-HD-Charon",
+            "es-US-Chirp3-HD-Algieba"
+        ],
+        "prompt_modifier": "C2 (near-native) level. Use sophisticated vocabulary and nuanced expressions."
+    }
+}
+
 def get_google_tts_client():
     credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     credentials = service_account.Credentials.from_service_account_info(
@@ -100,7 +167,7 @@ def get_sheets_client():
     )
     return build('sheets', 'v4', credentials=credentials)
 
-async def track_usage_google_sheets(user_id, username, first_name, last_name, topic):
+async def track_usage_google_sheets(user_id, username, first_name, last_name, topic, level):
     """Track student usage in Google Sheets"""
     try:
         if not config.TRACKING_SHEET_ID:
@@ -118,18 +185,19 @@ async def track_usage_google_sheets(user_id, username, first_name, last_name, to
             user_id,
             username or "No username",
             full_name,
-            topic[:50]  # Truncate long topics
+            topic[:50],  # Truncate long topics
+            level
         ]]
         
         # Append to sheet
         sheets_client.spreadsheets().values().append(
             spreadsheetId=config.TRACKING_SHEET_ID,
-            range="A:E",
+            range="A:F",  # Now includes level column
             valueInputOption="RAW",
             body={"values": row_data}
         ).execute()
         
-        logger.info(f"[Tracking] ✅ Logged to Google Sheets: {full_name} ({username}) - '{topic[:30]}'")
+        logger.info(f"[Tracking] ✅ Logged to Google Sheets: {full_name} ({username}) - '{topic[:30]}' - Level: {level}")
     except Exception as e:
         logger.error(f"[Tracking] ❌ Failed to log to Google Sheets: {e}")
 
@@ -146,6 +214,13 @@ def validate_topic(topic):
     if not topic:
         raise ValueError("Topic cannot be empty")
     return topic
+
+def validate_level(level_text):
+    level_text = level_text.upper().strip()
+    if level_text in LEVEL_CONFIGS:
+        return level_text
+    else:
+        raise ValueError(f"Invalid level. Please choose from: {', '.join(LEVEL_CONFIGS.keys())}")
 
 def split_text_into_sentences(text, max_length=200):
     # Remove asterisks from text before TTS generation
@@ -179,12 +254,12 @@ def split_text_into_sentences(text, max_length=200):
     wait=wait_exponential(multiplier=1, min=2, max=5),
     retry=retry_if_exception_type(Exception)
 )
-def generate_tts_chirp3_sync(text, voice_name):
+def generate_tts_chirp3_sync(text, voice_name, speaking_rate=0.75):
     """Generate TTS using Chirp3 HD voices for main texts - SPANISH VERSION"""
     try:
         # Remove asterisks from text
         text = text.replace('*', '')
-        logger.info(f"[Chirp3 TTS Español] Generating for voice '{voice_name}', text length: {len(text)}")
+        logger.info(f"[Chirp3 TTS Español] Generating for voice '{voice_name}', speed: {speaking_rate}, text length: {len(text)}")
         client = get_google_tts_client()
         sentences = split_text_into_sentences(text, max_length=200)
         logger.info(f"[Chirp3 TTS Español] Split into {len(sentences)} sentences")
@@ -198,7 +273,7 @@ def generate_tts_chirp3_sync(text, voice_name):
             )
             audio_config = texttospeech.AudioConfig(
                 audio_encoding=texttospeech.AudioEncoding.MP3,
-                speaking_rate=0.75  # 75% speed for Spanish
+                speaking_rate=speaking_rate
             )
             response = client.synthesize_speech(
                 input=synthesis_input, 
@@ -219,7 +294,7 @@ def generate_tts_chirp3_sync(text, voice_name):
     wait=wait_exponential(multiplier=1, min=2, max=5),
     retry=retry_if_exception_type(Exception)
 )
-def generate_tts_wavenet_sync(text, voice_name="es-ES-Wavenet-B"):
+def generate_tts_wavenet_sync(text, voice_name="es-ES-Wavenet-B", speaking_rate=0.95):
     """Generate TTS using Wavenet voices for Anki cards - SPANISH VERSION"""
     try:
         # Remove asterisks from Anki card text too
@@ -234,7 +309,7 @@ def generate_tts_wavenet_sync(text, voice_name="es-ES-Wavenet-B"):
         )
         audio_config = texttospeech.AudioConfig(
             audio_encoding=texttospeech.AudioEncoding.MP3,
-            speaking_rate=0.95  # Slightly slower for Anki cards
+            speaking_rate=speaking_rate
         )
         
         response = client.synthesize_speech(
@@ -250,15 +325,15 @@ def generate_tts_wavenet_sync(text, voice_name="es-ES-Wavenet-B"):
         logger.error(f"[Wavenet TTS Español] ❌ Failed for '{text[:50]}': {type(e).__name__}: {str(e)}")
         raise
 
-async def generate_tts_chirp3_async(text, voice_name):
+async def generate_tts_chirp3_async(text, voice_name, speaking_rate=0.75):
     """Async wrapper for Chirp3 TTS"""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, generate_tts_chirp3_sync, text, voice_name)
+    return await loop.run_in_executor(None, generate_tts_chirp3_sync, text, voice_name, speaking_rate)
 
-async def generate_tts_wavenet_async(text, voice_name="es-ES-Wavenet-B"):
+async def generate_tts_wavenet_async(text, voice_name="es-ES-Wavenet-B", speaking_rate=0.95):
     """Async wrapper for Wavenet TTS"""
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, generate_tts_wavenet_sync, text, voice_name)
+    return await loop.run_in_executor(None, generate_tts_wavenet_sync, text, voice_name, speaking_rate)
 
 def safe_filename(filename):
     filename = re.sub(r'[^\w\s.-]', '', filename)
@@ -291,14 +366,17 @@ def validate_deepseek_response(content):
     retry=retry_if_exception_type((Exception,)),
     before_sleep=lambda retry_state: logger.warning(f"Retry {retry_state.attempt_number}: {retry_state.outcome.exception()}")
 )
-def generate_content_with_deepseek(topic):
-    logger.info(f"[DeepSeek Español] Generating content for: '{topic}'")
+def generate_content_with_deepseek(topic, level):
+    logger.info(f"[DeepSeek Español] Generating content for: '{topic}' at level {level}")
+    
+    level_config = LEVEL_CONFIGS[level]
+    prompt_modifier = level_config["prompt_modifier"]
     
     prompt = f"""You are both an expert consultant on the topic given and a Spanish language teaching assistant. Create informationally highly insightful and nuanced learning materials with expert advice about the topic: "{topic}"
 
 Please generate a JSON response with the following structure:
 {{
-  "main_text": "An engaging and expertly insightful Spanish text at CEFR SOLID B1 level about {topic}. Should be 200-250 words long, must contain expert-level insights / information, should be natural. MUST contain relevant terminology and 3 Spanish verb phrases or useful expressions that are either typical for this context OR generically useful for B1 learners. Use SOLID B1 vocabulary - if there's any doubt that an expression might be weak B1 (tending toward A2), choose another expression. Include the complete phrases as they would appear in the text.",
+  "main_text": "An engaging and expertly insightful Spanish text at CEFR {level} level ({level_config['description']}) about {topic}. Should be 200-250 words long, must contain expert-level insights / information, should be natural. MUST contain relevant terminology and 3 Spanish verb phrases or useful expressions that are either typical for this context OR generically useful for {level} learners. Use {prompt_modifier} Include the complete phrases as they would appear in the text.",
   "collocations": [
     {{"spanish": "Spanish phrase/expression from text", "english": "English translation"}},
     // Exactly 15 items total
@@ -306,36 +384,36 @@ Please generate a JSON response with the following structure:
     // should include terminology IF RELEVANT
     // Remaining items should be useful collocations, expressions, verb+noun, or adjective+noun pairs from the text
     // ALL collocations must come directly from the main_text
-    // Use ONLY SOLID B1 vocabulary - avoid anything that might be borderline A2/B1
+    // Use ONLY {level}-appropriate vocabulary
   ],
   "opinion_texts": {{
-    "positive": "A natural Spanish response (SOLID B1 level, 80-120 words) adding extra expert insights to the main topic. Must incorporate some vocabulary from the collocations list naturally.",
-    "negative": "A natural Spanish response (SOLID B1 level, 80-120 words) giving contrasting expert insights to the main topic. Must incorporate some vocabulary from the collocations list naturally.",
-    "mixed": "A natural Spanish response (SOLID B1 level, 80-120 words) giving a balanced/mixed reaction to the main topic. Must incorporate some vocabulary from the collocations list naturally."
+    "positive": "A natural Spanish response ({level} level, 80-120 words) adding extra expert insights to the main topic. Must incorporate some vocabulary from the collocations list naturally.",
+    "negative": "A natural Spanish response ({level} level, 80-120 words) giving contrasting expert insights to the main topic. Must incorporate some vocabulary from the collocations list naturally.",
+    "mixed": "A natural Spanish response ({level} level, 80-120 words) giving a balanced/mixed reaction to the main topic. Must incorporate some vocabulary from the collocations list naturally."
   }},
   "discussion_questions": [
-    "Question 1 in Spanish (SOLID B1 level) - should ask about personal reaction to presented insights",
-    "Question 2 in Spanish (SOLID B1 level) - should ask about personal experience in reference to the topic",
-    "Question 3 in Spanish (SOLID B1 level) - should encourage reflection nuances in the differences in the insights",
-    "Question 4 in Spanish (SOLID B1 level) - should encourage a prediction",
-    "Question 5 in Spanish (SOLID B1 level) - should stimulate debate"
+    "Question 1 in Spanish ({level} level) - should ask about personal reaction to presented insights",
+    "Question 2 in Spanish ({level} level) - should ask about personal experience in reference to the topic",
+    "Question 3 in Spanish ({level} level) - should encourage reflection nuances in the differences in the insights",
+    "Question 4 in Spanish ({level} level) - should encourage a prediction",
+    "Question 5 in Spanish ({level} level) - should stimulate debate"
   ]
 }}
 
 CRITICAL REQUIREMENTS:
-1. Main text MUST contain 3 Spanish verb phrases or useful expressions appropriate for B1 level
+1. Main text MUST contain 3 Spanish verb phrases or useful expressions appropriate for {level} level
 2. ALL collocations must come from the main_text
 3. The first 3 collocations MUST be the verb phrases/expressions
 4. Should, if relevant and only if relevant, include some terminology
-5. Use SOLID B1 vocabulary throughout - avoid borderline A2/B1 expressions
+5. Use {prompt_modifier}
 6. Reaction texts must naturally use some collocations but sound expert and insightful
-7. Discussion questions should be thought-provoking but use B1-level language
+7. Discussion questions should be thought-provoking but use {level}-level language
 8. Return ONLY valid JSON, no additional text"""
 
     response = deepseek_client.chat.completions.create(
         model="deepseek-chat",
         messages=[
-            {"role": "system", "content": "You are an expert Spanish language teacher who creates engaging, natural content at CEFR SOLID B1 level with a focus on useful expressions and verb phrases. Always use solid B1 vocabulary - avoid anything that might be borderline A2. Always respond with valid JSON only."},
+            {"role": "system", "content": f"You are an expert Spanish language teacher who creates engaging, natural content at CEFR {level} level with a focus on useful expressions and verb phrases. {prompt_modifier} Always respond with valid JSON only."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.7,
@@ -351,10 +429,10 @@ CRITICAL REQUIREMENTS:
     
     content = json.loads(content_text)
     validate_deepseek_response(content)
-    logger.info(f"[DeepSeek Español] ✅ Content validated successfully")
+    logger.info(f"[DeepSeek Español] ✅ Content validated successfully for level {level}")
     return content
 
-async def create_vocabulary_file_with_tts(collocations, topic, progress_callback=None):
+async def create_vocabulary_file_with_tts(collocations, topic, level_config, progress_callback=None):
     """Create Anki vocabulary file with Wavenet TTS - SPANISH VERSION"""
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_topic_name = safe_filename(topic)
@@ -364,12 +442,16 @@ async def create_vocabulary_file_with_tts(collocations, topic, progress_callback
     audio_files = {}
     total_items = len(collocations)
     
-    logger.info(f"[Anki TTS Español] Starting generation for {total_items} collocations using Wavenet-B")
+    logger.info(f"[Anki TTS Español] Starting generation for {total_items} collocations using {level_config['wavenet_voice']}")
     
-    # Generate TTS for all collocations using Wavenet-B voice (Spanish)
+    # Generate TTS for all collocations using the appropriate Wavenet voice for the level
     tts_tasks = []
     for item in collocations:
-        tts_tasks.append(generate_tts_wavenet_async(item['spanish'], voice_name="es-ES-Wavenet-B"))
+        tts_tasks.append(generate_tts_wavenet_async(
+            item['spanish'], 
+            voice_name=level_config['wavenet_voice'],
+            speaking_rate=0.95
+        ))
     
     logger.info(f"[Anki TTS Español] Awaiting {len(tts_tasks)} concurrent TTS generations...")
     audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
@@ -453,10 +535,12 @@ def create_zip_package(vocab_filename, vocab_content, audio_files, html_filename
     
     return zip_filename, zip_buffer
 
-def create_html_document(topic, content, timestamp):
+def create_html_document(topic, content, timestamp, level):
     """Create HTML document - SPANISH VERSION"""
     safe_topic = safe_filename(topic)
     html_filename = f"{safe_topic}_{timestamp}_materials.html"
+    
+    level_config = LEVEL_CONFIGS[level]
     
     # Remove asterisks from all text content
     def remove_asterisks(text):
@@ -532,6 +616,16 @@ def create_html_document(topic, content, timestamp):
         .header .subtitle {{
             font-size: 0.9em;
             opacity: 0.9;
+        }}
+        .level-badge {{
+            display: inline-block;
+            background: white;
+            color: #f5576c;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-weight: bold;
+            margin-top: 10px;
+            font-size: 0.9em;
         }}
         .content {{
             padding: 40px;
@@ -689,7 +783,8 @@ def create_html_document(topic, content, timestamp):
         <div class="header">
             <h1>🎓 Materiales de Aprendizaje de Español</h1>
             <div class="subtitle">Tema: {topic}</div>
-            <div class="subtitle">Nivel: CEFR B1 Sólido</div>
+            <div class="subtitle">Nivel: CEFR {level} ({level_config['description']})</div>
+            <div class="level-badge">NIVEL {level}</div>
             <div class="subtitle">Generado: {datetime.now().strftime("%Y-%m-%d %H:%M")}</div>
         </div>
         <div class="content">
@@ -759,32 +854,70 @@ def create_html_document(topic, content, timestamp):
         </div>
         <div class="footer">
             <p>Generado por Spanish Learning Bot 🤖</p>
-            <p>Materiales de Nivel CEFR B1 Sólido</p>
+            <p>Materiales de Nivel CEFR {level} ({level_config['description']})</p>
+            <p>Velocidad de audio: {int(level_config['speaking_rate'] * 100)}%</p>
         </div>
     </div>
 </body>
 </html>"""
     
-    logger.info(f"[HTML Español] Created document: {html_filename}")
+    logger.info(f"[HTML Español] Created document for level {level}: {html_filename}")
     return html_filename, html_content
 
-# Chirp3 HD voices for Spanish narration
-SPANISH_CHIRP_VOICES = [
-    "es-ES-Chirp-HD-F",        # FEMALE
-    "es-ES-Chirp-HD-O",        # FEMALE  
-    "es-ES-Chirp3-HD-Gacrux",  # FEMALE
-    "es-US-Chirp3-HD-Leda",    # FEMALE
-    "es-ES-Chirp3-HD-Algenib", # MALE
-    "es-ES-Chirp3-HD-Charon",  # MALE
-    "es-US-Chirp3-HD-Algieba"  # MALE
-]
-
-async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Main handler for topic requests - SPANISH VERSION"""
+async def handle_topic_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle topic input - first step"""
     user_id = update.effective_user.id
     topic_raw = update.message.text.strip()
     
-    logger.info(f"[Bot Español] User {user_id} requested topic: '{topic_raw}'")
+    logger.info(f"[Bot Español] User {user_id} entered topic: '{topic_raw}'")
+    
+    # Validate topic
+    try:
+        topic = validate_topic(topic_raw)
+        logger.info(f"[Bot Español] Topic validated: '{topic}'")
+    except ValueError as e:
+        logger.error(f"[Bot Español] Invalid topic from user {user_id}: {str(e)}")
+        await update.message.reply_text(f"❌ Tema inválido: {str(e)}\n\nPor favor intenta con un tema diferente.")
+        return ConversationHandler.END
+    
+    # Store topic in user context
+    context.user_data['topic'] = topic
+    context.user_data['user_id'] = user_id
+    
+    # Ask for level
+    level_options = "\n".join([f"• {level} - {config['description']}" for level, config in LEVEL_CONFIGS.items()])
+    await update.message.reply_text(
+        f"✅ Tema válido: '{topic}'\n\n"
+        f"📊 Ahora selecciona el nivel de español:\n\n"
+        f"{level_options}\n\n"
+        f"Por favor responde con: B1, B2, C1 o C2"
+    )
+    
+    return LEVEL
+
+async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle level input - second step"""
+    user_id = update.effective_user.id
+    level_text = update.message.text.strip()
+    
+    # Validate level
+    try:
+        level = validate_level(level_text)
+    except ValueError as e:
+        logger.error(f"[Bot Español] Invalid level from user {user_id}: {level_text}")
+        await update.message.reply_text(f"❌ {str(e)}")
+        return LEVEL
+    
+    topic = context.user_data.get('topic')
+    if not topic:
+        logger.error(f"[Bot Español] No topic found for user {user_id}")
+        await update.message.reply_text("❌ Error: No se encontró el tema. Por favor comienza de nuevo con /start")
+        return ConversationHandler.END
+    
+    logger.info(f"[Bot Español] User {user_id} selected level {level} for topic: '{topic}'")
+    
+    # Store level in user context
+    context.user_data['level'] = level
     
     # Check rate limit
     if not rate_limiter.is_allowed(user_id):
@@ -795,17 +928,8 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"Has usado tus 5 solicitudes para esta hora.\n"
             f"Por favor, intenta de nuevo en {reset_time // 60} minutos."
         )
-        return
+        return ConversationHandler.END
     
-    # Validate topic
-    try:
-        topic = validate_topic(topic_raw)
-        logger.info(f"[Bot Español] Topic validated: '{topic}'")
-    except ValueError as e:
-        logger.error(f"[Bot Español] Invalid topic from user {user_id}: {str(e)}")
-        await update.message.reply_text(f"❌ Tema inválido: {str(e)}\n\nPor favor intenta con un tema diferente.")
-        return
-
     # Track usage
     user = update.effective_user
     await track_usage_google_sheets(
@@ -813,12 +937,18 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         username=user.username,
         first_name=user.first_name,
         last_name=user.last_name,
-        topic=topic
+        topic=topic,
+        level=level
     )
     
     await update.message.chat.send_action(action="typing")
+    
+    # Get level configuration
+    level_config = LEVEL_CONFIGS[level]
+    
     progress_msg = await update.message.reply_text(
-        f"📚 Materiales para tu tema '{topic[:20]}...'...\n\n"
+        f"📚 Materiales para tu tema '{topic[:20]}...'...\n"
+        f"🏆 Nivel: {level} ({level_config['description']})\n\n"
         f"⏳ Progreso: 0/5\n"
         f"⬜⬜⬜⬜⬜\n"
         f"Inicializando..."
@@ -829,7 +959,8 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         progress_bar = "🟩" * step + "⬜" * (5 - step)
         try:
             await progress_msg.edit_text(
-                f"📚 Materiales para tu tema '{topic[:20]}...'...\n\n"
+                f"📚 Materiales para tu tema '{topic[:20]}...'...\n"
+                f"🏆 Nivel: {level} ({level_config['description']})\n\n"
                 f"⏳ Progreso: {step}/5\n"
                 f"{progress_bar}\n"
                 f"{message}"
@@ -842,24 +973,24 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update_progress(1, "🤖 Generando contenido con IA...")
         await update.message.chat.send_action(action="typing")
         
-        logger.info(f"[Bot Español] Starting content generation for user {user_id}")
-        content = generate_content_with_deepseek(topic)
+        logger.info(f"[Bot Español] Starting content generation for user {user_id}, level {level}")
+        content = generate_content_with_deepseek(topic, level)
         
         if not content:
             logger.error(f"[Bot Español] Empty content returned")
             await update.message.reply_text("❌ Error al generar contenido. Por favor intenta de nuevo.")
-            return
+            return ConversationHandler.END
         
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_topic = safe_filename(topic)
         
         # Step 2: Create HTML document
         await update_progress(2, "📄 Creando documento HTML...")
-        html_filename, html_content = create_html_document(topic, content, timestamp)
+        html_filename, html_content = create_html_document(topic, content, timestamp, level)
         logger.info(f"[Bot Español] HTML document created: {html_filename}")
         
         # Step 3: Generate TTS for main text and opinion texts using Spanish Chirp3 HD voices
-        await update_progress(3, "🎧 Generando audio de narración (Chirp3 HD Español)...")
+        await update_progress(3, f"🎧 Generando audio de narración (Chirp3 HD Español, {int(level_config['speaking_rate']*100)}% velocidad)...")
         await update.message.chat.send_action(action="record_voice")
 
         text_mapping = {
@@ -869,16 +1000,20 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "Reacción_Equilibrada.mp3": content['opinion_texts']['mixed']
         }
 
-        # Select 4 random Spanish Chirp3 voices
-        selected_voices = random.sample(SPANISH_CHIRP_VOICES, 4)
-        logger.info(f"[Bot Español] Selected Spanish Chirp3 voices: {selected_voices}")
+        # Select 4 random Spanish Chirp3 voices for this level
+        selected_voices = random.sample(level_config['chirp_voices'], min(4, len(level_config['chirp_voices'])))
+        logger.info(f"[Bot Español] Selected Spanish Chirp3 voices for level {level}: {selected_voices}")
         
         audio_tasks = []
         for i, (filename, text) in enumerate(text_mapping.items()):
-            voice = selected_voices[i]
-            audio_tasks.append(generate_tts_chirp3_async(text, voice))
+            voice = selected_voices[i % len(selected_voices)]
+            audio_tasks.append(generate_tts_chirp3_async(
+                text, 
+                voice, 
+                speaking_rate=level_config['speaking_rate']
+            ))
 
-        logger.info(f"[Bot Español] Generating {len(audio_tasks)} Spanish Chirp3 narration files...")
+        logger.info(f"[Bot Español] Generating {len(audio_tasks)} Spanish Chirp3 narration files for level {level}...")
         audio_results = await asyncio.gather(*audio_tasks, return_exceptions=True)
         
         narration_files = []
@@ -888,12 +1023,12 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 audio_buffer = BytesIO(audio_data)
                 audio_buffer.name = filename
                 narration_files.append((filename, audio_buffer))
-                logger.info(f"[Bot Español] ✅ Chirp3 audio generated: {filename}")
+                logger.info(f"[Bot Español] ✅ Chirp3 audio generated for level {level}: {filename}")
             else:
                 logger.error(f"[Bot Español] ❌ Chirp3 TTS failed for {filename}: {audio_data}")
 
         # Step 4: Generate Anki vocabulary file with Spanish Wavenet TTS
-        await update_progress(4, "🎵 Generando TTS para expresiones de Anki (Wavenet-B Español)...")
+        await update_progress(4, f"🎵 Generando TTS para expresiones de Anki ({level_config['wavenet_voice']})...")
         await update.message.chat.send_action(action="record_voice")
 
         async def vocab_progress(current, total):
@@ -901,14 +1036,17 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 await update_progress(4, f"🎵 Generando TTS para Anki... ({current}/{total})")
 
         vocab_filename, vocab_content, audio_files = await create_vocabulary_file_with_tts(
-            content['collocations'], safe_topic, progress_callback=vocab_progress
+            content['collocations'], 
+            safe_topic, 
+            level_config,
+            progress_callback=vocab_progress
         )
         
         if not audio_files:
             logger.error(f"[Bot Español] No Anki audio files generated!")
             await update.message.reply_text("⚠️ Advertencia: No se pudo generar TTS para las tarjetas de Anki.")
         else:
-            logger.info(f"[Bot Español] ✅ Generated {len(audio_files)} Anki TTS files")
+            logger.info(f"[Bot Español] ✅ Generated {len(audio_files)} Anki TTS files for level {level}")
 
         # Step 5: Create ZIP package
         await update_progress(5, "📦 Creando paquete ZIP...")
@@ -925,13 +1063,14 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_document(
             document=html_file,
             filename=html_filename,
-            caption="📄 Abre este documento para ver tus textos del tema y lista de vocabulario"
+            caption=f"📄 Abre este documento para ver tus textos del tema y lista de vocabulario (Nivel {level})"
         )
         logger.info(f"[Bot Español] Sent HTML document")
 
         # 2. Instructional message
         await update.message.reply_text(
-            "👆 Puedes escuchar los textos del documento reproduciendo el audio a continuación 👇"
+            f"👆 Puedes escuchar los textos del documento reproduciendo el audio a continuación 👇\n"
+            f"🎧 Velocidad: {int(level_config['speaking_rate']*100)}%"
         )
 
         # 3. Send narration audio files (Spanish Chirp3)
@@ -953,10 +1092,10 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
         # 6. Send Anki .txt file
         anki_file = BytesIO(vocab_content.encode('utf-8'))
-        anki_file.name = "importar_anki.txt"
+        anki_file.name = f"importar_anki_{level}.txt"
         await update.message.reply_document(
             document=anki_file,
-            filename="importar_anki.txt"
+            filename=f"importar_anki_{level}.txt"
         )
         logger.info(f"[Bot Español] Sent Anki import file")
 
@@ -971,20 +1110,29 @@ async def handle_topic(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Final summary in Spanish
         file_size = zip_buffer.getbuffer().nbytes
-        logger.info(f"[Bot Español] ✅ Successfully completed request for user {user_id}")
+        logger.info(f"[Bot Español] ✅ Successfully completed request for user {user_id}, level {level}")
         await update.message.reply_text(
             f"✅ ¡Todos los materiales generados!\n\n"
             f"📊 Resumen:\n"
+            f"• Nivel: {level} ({level_config['description']})\n"
             f"• Expresiones: {len(content['collocations'])}\n"
             f"• Archivos TTS para Anki: {len(audio_files)}\n"
             f"• Audios de narración: {len(narration_files)}\n"
+            f"• Velocidad de audio: {int(level_config['speaking_rate']*100)}%\n"
             f"• Tamaño ZIP: {file_size / 1024 / 1024:.2f}MB"
         )
         
     except Exception as e:
         error_msg = f"❌ Error inesperado: {str(e)[:200]}"
-        logger.error(f"[Bot Español] ERROR for user {user_id}: {type(e).__name__}: {str(e)}", exc_info=True)
+        logger.error(f"[Bot Español] ERROR for user {user_id}, level {level}: {type(e).__name__}: {str(e)}", exc_info=True)
         await update.message.reply_text(error_msg)
+    
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Cancel the conversation"""
+    await update.message.reply_text("Operación cancelada.")
+    return ConversationHandler.END
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /start command - SPANISH VERSION"""
@@ -1007,51 +1155,74 @@ Algunos ejemplos de temas:
 - "Cómo ..."
 - "¿Por qué la gente...?"
 
-¡Todo el contenido está en español a nivel B1 sólido! 🇪🇸
+¡Escribe tu tema ahora! Luego te preguntaré por el nivel (B1, B2, C1 o C2). 🇪🇸
 """
     )
+    return TOPIC
 
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command - SPANISH VERSION"""
     user_id = update.effective_user.id
     reset_time = rate_limiter.get_reset_time(user_id)
     
+    level_descriptions = "\n".join([f"• {level} - {config['description']}" for level, config in LEVEL_CONFIGS.items()])
+    
     help_text = (
         "📖 **Cómo Usar:**\n\n"
         "1. Envíame un tema (máx 100 caracteres)\n"
-        "2. Recibirás:\n"
+        "2. Selecciona el nivel (B1, B2, C1 o C2)\n"
+        "3. Recibirás:\n"
         "   • Documento HTML con todos los materiales\n"
         "   • 4 archivos de audio de narración (voces Chirp3 HD en español)\n"
         "   • Archivo .txt para importar en Anki\n"
-        "   • Paquete ZIP con archivos TTS para Anki (voz Wavenet-B en español)\n\n"
+        "   • Paquete ZIP con archivos TTS para Anki\n\n"
+        "📊 **Niveles Disponibles:**\n"
+        f"{level_descriptions}\n\n"
         "📦 **Para Anki:**\n"
         "   • Extrae los archivos MP3 del ZIP a la carpeta collection.media\n"
         "   • Importa el archivo .txt en Anki\n\n"
         "⚡ **Límite de Tasa:** 5 solicitudes/hora\n"
-        "🇪🇸 **Nivel:** Español B1 Sólido"
+        "🇪🇸 **Idioma:** Español"
     )
     
     if reset_time > 0:
         help_text += f"\n⏱️ Se restablece en {reset_time // 60} min"
     
     await update.message.reply_text(help_text, parse_mode='Markdown')
+    return ConversationHandler.END
+
+async def handle_direct_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle direct messages (fallback)"""
+    await update.message.reply_text(
+        "Por favor usa /start para comenzar o /help para ayuda.\n\n"
+        "Primero escribe un tema, luego seleccionarás el nivel (B1, B2, C1 o C2)."
+    )
 
 if __name__ == "__main__":
     logger.info("=" * 60)
-    logger.info("🤖 Iniciando Spanish Learning Telegram Bot")
+    logger.info("🤖 Iniciando Spanish Learning Telegram Bot con selección de nivel")
     logger.info("=" * 60)
-    logger.info(f"Configuración:")
-    logger.info(f"  - Voces Chirp3 para narración: {len(SPANISH_CHIRP_VOICES)} disponibles")
-    logger.info(f"  - Voz Wavenet-B para TTS de Anki (español)")
-    logger.info(f"  - Velocidad de audio: 75% para español")
-    logger.info(f"  - Nivel: CEFR B1 Sólido")
-    logger.info(f"  - Límite de tasa: {config.RATE_LIMIT_REQUESTS} solicitudes por {config.RATE_LIMIT_WINDOW}s")
+    logger.info(f"Niveles disponibles:")
+    for level, config in LEVEL_CONFIGS.items():
+        logger.info(f"  - {level}: {config['description']} (velocidad: {int(config['speaking_rate']*100)}%, voz: {config['wavenet_voice']})")
+    logger.info(f"Límite de tasa: {config.RATE_LIMIT_REQUESTS} solicitudes por {config.RATE_LIMIT_WINDOW}s")
     logger.info("=" * 60)
     
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start))
+    
+    # Create conversation handler
+    conv_handler = ConversationHandler(
+        entry_points=[CommandHandler('start', start)],
+        states={
+            TOPIC: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_topic_input)],
+            LEVEL: [MessageHandler(filters.TEXT & ~filters.COMMAND, handle_level_input)],
+        },
+        fallbacks=[CommandHandler('cancel', cancel)],
+    )
+    
+    application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_topic))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_message))
     
     logger.info("✅ El bot está ejecutándose y listo para aceptar mensajes...")
     application.run_polling()
