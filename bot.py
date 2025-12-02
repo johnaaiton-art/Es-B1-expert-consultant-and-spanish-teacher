@@ -360,6 +360,46 @@ def validate_deepseek_response(content):
         raise ValueError("discussion_questions must be a list")
     return True
 
+def get_fallback_content(topic, level):
+    """Provide fallback content if DeepSeek API fails"""
+    logger.info(f"[Fallback] Generating fallback content for level {level}")
+    
+    level_config = LEVEL_CONFIGS[level]
+    
+    # Simple fallback content that matches the structure
+    return {
+        "main_text": f"Este texto trata sobre el tema '{topic}' a nivel {level}. Es un ejemplo de contenido educativo en español que incluye vocabulario útil y expresiones apropiadas para el nivel {level}. El objetivo es proporcionar materiales de aprendizaje significativos para estudiantes que buscan mejorar sus habilidades lingüísticas en contextos prácticos.",
+        "collocations": [
+            {"spanish": "tratar sobre", "english": "to be about"},
+            {"spanish": "nivel apropiado", "english": "appropriate level"},
+            {"spanish": "vocabulario útil", "english": "useful vocabulary"},
+            {"spanish": "materiales de aprendizaje", "english": "learning materials"},
+            {"spanish": "expresiones comunes", "english": "common expressions"},
+            {"spanish": "contenido educativo", "english": "educational content"},
+            {"spanish": "objetivo principal", "english": "main objective"},
+            {"spanish": "hablar de", "english": "to talk about"},
+            {"spanish": "aprender español", "english": "to learn Spanish"},
+            {"spanish": "mejorar habilidades", "english": "to improve skills"},
+            {"spanish": "practicar regularmente", "english": "to practice regularly"},
+            {"spanish": "entender conceptos", "english": "to understand concepts"},
+            {"spanish": "comunicarse efectivamente", "english": "to communicate effectively"},
+            {"spanish": "desarrollar confianza", "english": "to develop confidence"},
+            {"spanish": "lograr metas", "english": "to achieve goals"}
+        ],
+        "opinion_texts": {
+            "positive": f"Este tema es muy relevante para estudiantes de español a nivel {level}. Proporciona oportunidades excelentes para practicar vocabulario y expresiones útiles en contextos reales, lo que facilita la adquisición natural del idioma.",
+            "negative": f"Aunque el tema puede ser interesante, algunos estudiantes de nivel {level} podrían encontrar desafíos al discutir conceptos complejos sin suficiente preparación previa o vocabulario especializado.",
+            "mixed": f"El tema ofrece tanto oportunidades como desafíos para estudiantes de nivel {level}. Con la guía adecuada y recursos apropiados, puede ser una experiencia de aprendizaje muy valiosa que desarrolla múltiples competencias lingüísticas."
+        },
+        "discussion_questions": [
+            f"¿Qué aspectos de este tema te parecen más interesantes para practicar español a nivel {level}?",
+            f"¿Has tenido experiencias personales relacionadas con este tema que quisieras compartir en español?",
+            f"¿Qué diferencias notas en cómo se discute este tema en español comparado con otros idiomas que conoces?",
+            f"¿Cómo crees que este tema podría evolucionar o cambiar en el futuro según tu perspectiva?",
+            f"¿Qué argumentos a favor y en contra podrías presentar sobre este tema en una discusión en español?"
+        ]
+    }
+
 @retry(
     stop=stop_after_attempt(config.API_RETRY_ATTEMPTS),
     wait=wait_exponential(multiplier=1, min=4, max=10),
@@ -369,14 +409,22 @@ def validate_deepseek_response(content):
 def generate_content_with_deepseek(topic, level):
     logger.info(f"[DeepSeek Español] Generating content for: '{topic}' at level {level}")
     
+    # Truncate topic if it's too long for the prompt
+    max_topic_length = 80  # Keep topic short for API
+    if len(topic) > max_topic_length:
+        truncated_topic = topic[:max_topic_length] + "..."
+        logger.warning(f"[DeepSeek Español] Truncating topic from {len(topic)} to {max_topic_length} chars")
+    else:
+        truncated_topic = topic
+    
     level_config = LEVEL_CONFIGS[level]
     prompt_modifier = level_config["prompt_modifier"]
     
-    prompt = f"""You are both an expert consultant on the topic given and a Spanish language teaching assistant. Create informationally highly insightful and nuanced learning materials with expert advice about the topic: "{topic}"
+    prompt = f"""You are both an expert consultant on the topic given and a Spanish language teaching assistant. Create informationally highly insightful and nuanced learning materials with expert advice about the topic: "{truncated_topic}"
 
 Please generate a JSON response with the following structure:
 {{
-  "main_text": "An engaging and expertly insightful Spanish text at CEFR {level} level ({level_config['description']}) about {topic}. Should be 200-250 words long, must contain expert-level insights / information, should be natural. MUST contain relevant terminology and 3 Spanish verb phrases or useful expressions that are either typical for this context OR generically useful for {level} learners. Use {prompt_modifier} Include the complete phrases as they would appear in the text.",
+  "main_text": "An engaging and expertly insightful Spanish text at CEFR {level} level ({level_config['description']}) about {truncated_topic}. Should be 200-250 words long, must contain expert-level insights / information, should be natural. MUST contain relevant terminology and 3 Spanish verb phrases or useful expressions that are either typical for this context OR generically useful for {level} learners. Use {prompt_modifier} Include the complete phrases as they would appear in the text.",
   "collocations": [
     {{"spanish": "Spanish phrase/expression from text", "english": "English translation"}},
     // Exactly 15 items total
@@ -410,27 +458,34 @@ CRITICAL REQUIREMENTS:
 7. Discussion questions should be thought-provoking but use {level}-level language
 8. Return ONLY valid JSON, no additional text"""
 
-    response = deepseek_client.chat.completions.create(
-        model="deepseek-chat",
-        messages=[
-            {"role": "system", "content": f"You are an expert Spanish language teacher who creates engaging, natural content at CEFR {level} level with a focus on useful expressions and verb phrases. {prompt_modifier} Always respond with valid JSON only."},
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0.7,
-        timeout=45.0
-    )
-    
-    content_text = response.choices[0].message.content
-    logger.info(f"[DeepSeek Español] Received response, parsing...")
-    
-    json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
-    if json_match:
-        content_text = json_match.group()
-    
-    content = json.loads(content_text)
-    validate_deepseek_response(content)
-    logger.info(f"[DeepSeek Español] ✅ Content validated successfully for level {level}")
-    return content
+    try:
+        response = deepseek_client.chat.completions.create(
+            model="deepseek-chat",
+            messages=[
+                {"role": "system", "content": f"You are an expert Spanish language teacher who creates engaging, natural content at CEFR {level} level with a focus on useful expressions and verb phrases. {prompt_modifier} Always respond with valid JSON only."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.7,
+            timeout=60.0  # Increased timeout from 45 to 60 seconds
+        )
+        
+        content_text = response.choices[0].message.content
+        logger.info(f"[DeepSeek Español] Received response, parsing...")
+        
+        json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
+        if json_match:
+            content_text = json_match.group()
+        
+        content = json.loads(content_text)
+        validate_deepseek_response(content)
+        logger.info(f"[DeepSeek Español] ✅ Content validated successfully for level {level}")
+        return content
+        
+    except Exception as e:
+        logger.error(f"[DeepSeek Español] ❌ Error generating content: {type(e).__name__}: {str(e)}")
+        # Return fallback content if DeepSeek fails
+        logger.warning(f"[DeepSeek Español] Using fallback content for topic: {truncated_topic}")
+        return get_fallback_content(truncated_topic, level)
 
 async def create_vocabulary_file_with_tts(collocations, topic, level_config, progress_callback=None):
     """Create Anki vocabulary file with Wavenet TTS - SPANISH VERSION"""
@@ -930,16 +985,19 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return ConversationHandler.END
     
-    # Track usage
+    # Track usage (but don't fail if tracking fails)
     user = update.effective_user
-    await track_usage_google_sheets(
-        user_id=user.id,
-        username=user.username,
-        first_name=user.first_name,
-        last_name=user.last_name,
-        topic=topic,
-        level=level
-    )
+    try:
+        await track_usage_google_sheets(
+            user_id=user.id,
+            username=user.username,
+            first_name=user.first_name,
+            last_name=user.last_name,
+            topic=topic,
+            level=level
+        )
+    except Exception as e:
+        logger.error(f"[Bot Español] Failed to track usage, continuing anyway: {e}")
     
     await update.message.chat.send_action(action="typing")
     
