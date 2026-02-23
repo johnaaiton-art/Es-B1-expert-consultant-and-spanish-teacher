@@ -29,14 +29,11 @@ logger = logging.getLogger(__name__)
 # Load environment variables
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
-GOOGLE_CREDENTIALS_JSON = os.getenv("GOOGLE_CREDENTIALS_JSON")
 
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment variables")
 if not DEEPSEEK_API_KEY:
     raise ValueError("Missing DEEPSEEK_API_KEY in environment variables")
-if not GOOGLE_CREDENTIALS_JSON:
-    raise ValueError("Missing GOOGLE_CREDENTIALS_JSON in environment variables")
 
 # Conversation states
 TOPIC, LEVEL = range(2)
@@ -64,7 +61,7 @@ class RateLimiter:
         self.requests = defaultdict(list)
         self.max_requests = max_requests
         self.window = window
-    
+
     def is_allowed(self, user_id):
         now = time.time()
         user_requests = self.requests[user_id]
@@ -73,7 +70,7 @@ class RateLimiter:
             return False
         user_requests.append(now)
         return True
-    
+
     def get_reset_time(self, user_id):
         if not self.requests[user_id]:
             return 0
@@ -151,18 +148,16 @@ LEVEL_CONFIGS = {
 }
 
 def get_google_tts_client():
-    credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    credentials = service_account.Credentials.from_service_account_info(
-        credentials_dict,
+    credentials = service_account.Credentials.from_service_account_file(
+        "google-creds.json",
         scopes=["https://www.googleapis.com/auth/cloud-platform"]
     )
     return texttospeech.TextToSpeechClient(credentials=credentials)
-    
+
 def get_sheets_client():
     """Initialize Google Sheets client"""
-    credentials_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
-    credentials = service_account.Credentials.from_service_account_info(
-        credentials_dict,
+    credentials = service_account.Credentials.from_service_account_file(
+        "google-creds.json",
         scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
     return build('sheets', 'v4', credentials=credentials)
@@ -173,30 +168,28 @@ async def track_usage_google_sheets(user_id, username, first_name, last_name, to
         if not config.TRACKING_SHEET_ID:
             logger.warning("[Tracking] No TRACKING_SHEET_ID configured, skipping")
             return
-        
+
         sheets_client = get_sheets_client()
-        
-        # Prepare data row
+
         timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         full_name = f"{first_name or ''} {last_name or ''}".strip() or "Unknown"
-        
+
         row_data = [[
             timestamp,
             user_id,
             username or "No username",
             full_name,
-            topic[:50],  # Truncate long topics
+            topic[:50],
             level
         ]]
-        
-        # Append to sheet
+
         sheets_client.spreadsheets().values().append(
             spreadsheetId=config.TRACKING_SHEET_ID,
-            range="A:F",  # Now includes level column
+            range="A:F",
             valueInputOption="RAW",
             body={"values": row_data}
         ).execute()
-        
+
         logger.info(f"[Tracking] ✅ Logged to Google Sheets: {full_name} ({username}) - '{topic[:30]}' - Level: {level}")
     except Exception as e:
         logger.error(f"[Tracking] ❌ Failed to log to Google Sheets: {e}")
@@ -223,7 +216,6 @@ def validate_level(level_text):
         raise ValueError(f"Invalid level. Please choose from: {', '.join(LEVEL_CONFIGS.keys())}")
 
 def split_text_into_sentences(text, max_length=200):
-    # Remove asterisks from text before TTS generation
     text = text.replace('*', '')
     sentences = re.split(r'([.!?])\s+', text)
     result = []
@@ -257,13 +249,12 @@ def split_text_into_sentences(text, max_length=200):
 def generate_tts_chirp3_sync(text, voice_name, speaking_rate=0.75):
     """Generate TTS using Chirp3 HD voices for main texts - SPANISH VERSION"""
     try:
-        # Remove asterisks from text
         text = text.replace('*', '')
         logger.info(f"[Chirp3 TTS Español] Generating for voice '{voice_name}', speed: {speaking_rate}, text length: {len(text)}")
         client = get_google_tts_client()
         sentences = split_text_into_sentences(text, max_length=200)
         logger.info(f"[Chirp3 TTS Español] Split into {len(sentences)} sentences")
-        
+
         all_audio = b""
         for idx, sentence in enumerate(sentences):
             synthesis_input = texttospeech.SynthesisInput(text=sentence)
@@ -276,13 +267,13 @@ def generate_tts_chirp3_sync(text, voice_name, speaking_rate=0.75):
                 speaking_rate=speaking_rate
             )
             response = client.synthesize_speech(
-                input=synthesis_input, 
-                voice=voice, 
+                input=synthesis_input,
+                voice=voice,
                 audio_config=audio_config
             )
             all_audio += response.audio_content
             logger.info(f"[Chirp3 TTS Español] Sentence {idx+1}/{len(sentences)} completed")
-        
+
         logger.info(f"[Chirp3 TTS Español] ✅ Success: {len(all_audio)} bytes")
         return all_audio
     except Exception as e:
@@ -297,11 +288,10 @@ def generate_tts_chirp3_sync(text, voice_name, speaking_rate=0.75):
 def generate_tts_wavenet_sync(text, voice_name="es-ES-Wavenet-B", speaking_rate=0.95):
     """Generate TTS using Wavenet voices for Anki cards - SPANISH VERSION"""
     try:
-        # Remove asterisks from Anki card text too
         text = text.replace('*', '')
         logger.info(f"[Wavenet TTS Español] Generating for '{text[:50]}...' with voice '{voice_name}'")
         client = get_google_tts_client()
-        
+
         synthesis_input = texttospeech.SynthesisInput(text=text)
         voice = texttospeech.VoiceSelectionParams(
             language_code="es-ES",
@@ -311,13 +301,13 @@ def generate_tts_wavenet_sync(text, voice_name="es-ES-Wavenet-B", speaking_rate=
             audio_encoding=texttospeech.AudioEncoding.MP3,
             speaking_rate=speaking_rate
         )
-        
+
         response = client.synthesize_speech(
             input=synthesis_input,
             voice=voice,
             audio_config=audio_config
         )
-        
+
         audio_size = len(response.audio_content)
         logger.info(f"[Wavenet TTS Español] ✅ Success: {audio_size} bytes for '{text[:30]}'")
         return response.audio_content
@@ -363,10 +353,7 @@ def validate_deepseek_response(content):
 def get_fallback_content(topic, level):
     """Provide fallback content if DeepSeek API fails"""
     logger.info(f"[Fallback] Generating fallback content for level {level}")
-    
-    level_config = LEVEL_CONFIGS[level]
-    
-    # Simple fallback content that matches the structure
+
     return {
         "main_text": f"Este texto trata sobre el tema '{topic}' a nivel {level}. Es un ejemplo de contenido educativo en español que incluye vocabulario útil y expresiones apropiadas para el nivel {level}. El objetivo es proporcionar materiales de aprendizaje significativos para estudiantes que buscan mejorar sus habilidades lingüísticas en contextos prácticos.",
         "collocations": [
@@ -408,18 +395,17 @@ def get_fallback_content(topic, level):
 )
 def generate_content_with_deepseek(topic, level):
     logger.info(f"[DeepSeek Español] Generating content for: '{topic}' at level {level}")
-    
-    # Truncate topic if it's too long for the prompt
-    max_topic_length = 80  # Keep topic short for API
+
+    max_topic_length = 80
     if len(topic) > max_topic_length:
         truncated_topic = topic[:max_topic_length] + "..."
         logger.warning(f"[DeepSeek Español] Truncating topic from {len(topic)} to {max_topic_length} chars")
     else:
         truncated_topic = topic
-    
+
     level_config = LEVEL_CONFIGS[level]
     prompt_modifier = level_config["prompt_modifier"]
-    
+
     prompt = f"""You are both an expert consultant on the topic given and a Spanish language teaching assistant. Create informationally highly insightful and nuanced learning materials with expert advice about the topic: "{truncated_topic}"
 
 Please generate a JSON response with the following structure:
@@ -466,24 +452,23 @@ CRITICAL REQUIREMENTS:
                 {"role": "user", "content": prompt}
             ],
             temperature=0.7,
-            timeout=60.0  # Increased timeout from 45 to 60 seconds
+            timeout=60.0
         )
-        
+
         content_text = response.choices[0].message.content
         logger.info(f"[DeepSeek Español] Received response, parsing...")
-        
+
         json_match = re.search(r'\{.*\}', content_text, re.DOTALL)
         if json_match:
             content_text = json_match.group()
-        
+
         content = json.loads(content_text)
         validate_deepseek_response(content)
         logger.info(f"[DeepSeek Español] ✅ Content validated successfully for level {level}")
         return content
-        
+
     except Exception as e:
         logger.error(f"[DeepSeek Español] ❌ Error generating content: {type(e).__name__}: {str(e)}")
-        # Return fallback content if DeepSeek fails
         logger.warning(f"[DeepSeek Español] Using fallback content for topic: {truncated_topic}")
         return get_fallback_content(truncated_topic, level)
 
@@ -492,68 +477,57 @@ async def create_vocabulary_file_with_tts(collocations, topic, level_config, pro
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     safe_topic_name = safe_filename(topic)
     filename = f"{safe_topic_name}_{timestamp}_collocations.txt"
-    
+
     content = ""
     audio_files = {}
     total_items = len(collocations)
-    
+
     logger.info(f"[Anki TTS Español] Starting generation for {total_items} collocations using {level_config['wavenet_voice']}")
-    
-    # Generate TTS for all collocations using the appropriate Wavenet voice for the level
+
     tts_tasks = []
     for item in collocations:
         tts_tasks.append(generate_tts_wavenet_async(
-            item['spanish'], 
+            item['spanish'],
             voice_name=level_config['wavenet_voice'],
             speaking_rate=0.95
         ))
-    
+
     logger.info(f"[Anki TTS Español] Awaiting {len(tts_tasks)} concurrent TTS generations...")
     audio_results = await asyncio.gather(*tts_tasks, return_exceptions=True)
     logger.info(f"[Anki TTS Español] All TTS generations completed")
-    
+
     success_count = 0
     failed_count = 0
-    
+
     for idx, (item, audio_data) in enumerate(zip(collocations, audio_results)):
         spanish_text = item['spanish']
-        
+
         if progress_callback:
             await progress_callback(idx + 1, total_items)
-        
-        # Check if audio generation succeeded
+
         if isinstance(audio_data, Exception):
             logger.error(f"[Anki TTS Español] ❌ Exception for '{spanish_text}': {type(audio_data).__name__}: {audio_data}")
             failed_count += 1
-            # Add row without audio: English | Spanish
             content += f"{item['english']}\t{item['spanish']}\n"
         elif not audio_data:
             logger.error(f"[Anki TTS Español] ❌ Empty data for '{spanish_text}'")
             failed_count += 1
-            # Add row without audio: English | Spanish
             content += f"{item['english']}\t{item['spanish']}\n"
         else:
-            # Success - create filename using MD5 hash
             hash_object = hashlib.md5(spanish_text.encode())
             audio_filename = f"tts_{hash_object.hexdigest()}.mp3"
             audio_filename = safe_filename(audio_filename)
-            
-            # Store audio data
             audio_files[audio_filename] = audio_data
-            
-            # Create Anki sound tag
             anki_tag = f"[sound:{audio_filename}]"
-            
-            # Add row with 3 columns: English | Spanish | Audio
             content += f"{item['english']}\t{item['spanish']}\t{anki_tag}\n"
             success_count += 1
             logger.info(f"[Anki TTS Español] ✅ {idx+1}/{total_items}: '{spanish_text[:30]}' -> {audio_filename}")
-    
+
     logger.info(f"[Anki TTS Español] SUMMARY: ✅ {success_count} succeeded, ❌ {failed_count} failed out of {total_items} total")
-    
+
     if failed_count > 0:
         logger.warning(f"[Anki TTS Español] ⚠️ WARNING: {failed_count}/{total_items} TTS generations failed")
-    
+
     return filename, content, audio_files
 
 def create_zip_package(vocab_filename, vocab_content, audio_files, html_filename, html_content, topic, timestamp):
@@ -561,54 +535,49 @@ def create_zip_package(vocab_filename, vocab_content, audio_files, html_filename
     safe_topic_name = safe_filename(topic)
     zip_filename = f"{safe_topic_name}_{timestamp}_complete_package.zip"
     zip_buffer = BytesIO()
-    
+
     logger.info(f"[ZIP Español] Creating package with {len(audio_files)} audio files")
-    
+
     with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-        # Add vocabulary text file
         safe_vocab = safe_filename(vocab_filename)
         zip_file.writestr(safe_vocab, vocab_content.encode('utf-8'))
         logger.info(f"[ZIP Español] Added vocabulary file: {safe_vocab}")
-        
-        # Add all Anki TTS audio files
+
         for audio_filename, audio_data in audio_files.items():
             safe_audio = safe_filename(audio_filename)
             zip_file.writestr(safe_audio, audio_data)
         logger.info(f"[ZIP Español] Added {len(audio_files)} Anki TTS audio files")
-        
-        # Add HTML document
+
         safe_html = safe_filename(html_filename)
         zip_file.writestr(safe_html, html_content.encode('utf-8'))
         logger.info(f"[ZIP Español] Added HTML file: {safe_html}")
-    
+
     zip_buffer.seek(0)
     file_size = zip_buffer.getbuffer().nbytes
     logger.info(f"[ZIP Español] Package size: {file_size / 1024 / 1024:.2f}MB")
-    
+
     if file_size > config.MAX_FILE_SIZE:
         raise ValueError(f"ZIP too large: {file_size / 1024 / 1024:.1f}MB")
-    
+
     return zip_filename, zip_buffer
 
 def create_html_document(topic, content, timestamp, level):
     """Create HTML document - SPANISH VERSION"""
     safe_topic = safe_filename(topic)
     html_filename = f"{safe_topic}_{timestamp}_materials.html"
-    
+
     level_config = LEVEL_CONFIGS[level]
-    
-    # Remove asterisks from all text content
+
     def remove_asterisks(text):
         return text.replace('*', '')
-    
+
     clean_main_text = remove_asterisks(content['main_text'])
     clean_positive = remove_asterisks(content['opinion_texts']['positive'])
     clean_negative = remove_asterisks(content['opinion_texts']['negative'])
     clean_mixed = remove_asterisks(content['opinion_texts']['mixed'])
-    
+
     vocab_rows = ""
     for i, item in enumerate(content['collocations'], 1):
-        # Also clean collocation text if it has asterisks
         clean_spanish = remove_asterisks(item['spanish'])
         vocab_rows += f"""
         <tr>
@@ -617,10 +586,9 @@ def create_html_document(topic, content, timestamp, level):
             <td class="english">{item['english']}</td>
         </tr>
         """
-    
+
     questions_html = ""
     for i, question in enumerate(content['discussion_questions'], 1):
-        # Remove asterisks from questions too
         clean_question = remove_asterisks(question)
         questions_html += f"""
         <div class="question">
@@ -628,7 +596,7 @@ def create_html_document(topic, content, timestamp, level):
             <span class="question-text">{clean_question}</span>
         </div>
         """
-    
+
     html_content = f"""<!DOCTYPE html>
 <html lang="es">
 <head>
@@ -915,7 +883,7 @@ def create_html_document(topic, content, timestamp, level):
     </div>
 </body>
 </html>"""
-    
+
     logger.info(f"[HTML Español] Created document for level {level}: {html_filename}")
     return html_filename, html_content
 
@@ -923,10 +891,9 @@ async def handle_topic_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
     """Handle topic input - first step"""
     user_id = update.effective_user.id
     topic_raw = update.message.text.strip()
-    
+
     logger.info(f"[Bot Español] User {user_id} entered topic: '{topic_raw}'")
-    
-    # Validate topic
+
     try:
         topic = validate_topic(topic_raw)
         logger.info(f"[Bot Español] Topic validated: '{topic}'")
@@ -934,12 +901,10 @@ async def handle_topic_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         logger.error(f"[Bot Español] Invalid topic from user {user_id}: {str(e)}")
         await update.message.reply_text(f"❌ Tema inválido: {str(e)}\n\nPor favor intenta con un tema diferente.")
         return ConversationHandler.END
-    
-    # Store topic in user context
+
     context.user_data['topic'] = topic
     context.user_data['user_id'] = user_id
-    
-    # Ask for level
+
     level_options = "\n".join([f"• {level} - {config['description']}" for level, config in LEVEL_CONFIGS.items()])
     await update.message.reply_text(
         f"✅ Tema válido: '{topic}'\n\n"
@@ -947,34 +912,31 @@ async def handle_topic_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"{level_options}\n\n"
         f"Por favor responde con: B1, B2, C1 o C2"
     )
-    
+
     return LEVEL
 
 async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle level input - second step"""
     user_id = update.effective_user.id
     level_text = update.message.text.strip()
-    
-    # Validate level
+
     try:
         level = validate_level(level_text)
     except ValueError as e:
         logger.error(f"[Bot Español] Invalid level from user {user_id}: {level_text}")
         await update.message.reply_text(f"❌ {str(e)}")
         return LEVEL
-    
+
     topic = context.user_data.get('topic')
     if not topic:
         logger.error(f"[Bot Español] No topic found for user {user_id}")
         await update.message.reply_text("❌ Error: No se encontró el tema. Por favor comienza de nuevo con /start")
         return ConversationHandler.END
-    
+
     logger.info(f"[Bot Español] User {user_id} selected level {level} for topic: '{topic}'")
-    
-    # Store level in user context
+
     context.user_data['level'] = level
-    
-    # Check rate limit
+
     if not rate_limiter.is_allowed(user_id):
         reset_time = rate_limiter.get_reset_time(user_id)
         logger.warning(f"[Bot Español] User {user_id} rate limited, reset in {reset_time}s")
@@ -984,8 +946,7 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"Por favor, intenta de nuevo en {reset_time // 60} minutos."
         )
         return ConversationHandler.END
-    
-    # Track usage (but don't fail if tracking fails)
+
     user = update.effective_user
     try:
         await track_usage_google_sheets(
@@ -998,12 +959,11 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
     except Exception as e:
         logger.error(f"[Bot Español] Failed to track usage, continuing anyway: {e}")
-    
+
     await update.message.chat.send_action(action="typing")
-    
-    # Get level configuration
+
     level_config = LEVEL_CONFIGS[level]
-    
+
     progress_msg = await update.message.reply_text(
         f"📚 Materiales para tu tema '{topic[:20]}...'...\n"
         f"🏆 Nivel: {level} ({level_config['description']})\n\n"
@@ -1011,8 +971,7 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         f"⬜⬜⬜⬜⬜\n"
         f"Inicializando..."
     )
-    
-    # Progress tracking
+
     async def update_progress(step, message):
         progress_bar = "🟩" * step + "⬜" * (5 - step)
         try:
@@ -1025,55 +984,51 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
         except:
             pass
-    
+
     try:
-        # Step 1: Generate content with DeepSeek
         await update_progress(1, "🤖 Generando contenido con IA...")
         await update.message.chat.send_action(action="typing")
-        
+
         logger.info(f"[Bot Español] Starting content generation for user {user_id}, level {level}")
         content = generate_content_with_deepseek(topic, level)
-        
+
         if not content:
             logger.error(f"[Bot Español] Empty content returned")
             await update.message.reply_text("❌ Error al generar contenido. Por favor intenta de nuevo.")
             return ConversationHandler.END
-        
+
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         safe_topic = safe_filename(topic)
-        
-        # Step 2: Create HTML document
+
         await update_progress(2, "📄 Creando documento HTML...")
         html_filename, html_content = create_html_document(topic, content, timestamp, level)
         logger.info(f"[Bot Español] HTML document created: {html_filename}")
-        
-        # Step 3: Generate TTS for main text and opinion texts using Spanish Chirp3 HD voices
+
         await update_progress(3, f"🎧 Generando audio de narración (Chirp3 HD Español, {int(level_config['speaking_rate']*100)}% velocidad)...")
         await update.message.chat.send_action(action="record_voice")
 
         text_mapping = {
             "Texto_Principal.mp3": content['main_text'],
-            "Reacción_Positiva.mp3": content['opinion_texts']['positive'],
-            "Reacción_Crítica.mp3": content['opinion_texts']['negative'],
-            "Reacción_Equilibrada.mp3": content['opinion_texts']['mixed']
+            "Reaccion_Positiva.mp3": content['opinion_texts']['positive'],
+            "Reaccion_Critica.mp3": content['opinion_texts']['negative'],
+            "Reaccion_Equilibrada.mp3": content['opinion_texts']['mixed']
         }
 
-        # Select 4 random Spanish Chirp3 voices for this level
         selected_voices = random.sample(level_config['chirp_voices'], min(4, len(level_config['chirp_voices'])))
         logger.info(f"[Bot Español] Selected Spanish Chirp3 voices for level {level}: {selected_voices}")
-        
+
         audio_tasks = []
         for i, (filename, text) in enumerate(text_mapping.items()):
             voice = selected_voices[i % len(selected_voices)]
             audio_tasks.append(generate_tts_chirp3_async(
-                text, 
-                voice, 
+                text,
+                voice,
                 speaking_rate=level_config['speaking_rate']
             ))
 
         logger.info(f"[Bot Español] Generating {len(audio_tasks)} Spanish Chirp3 narration files for level {level}...")
         audio_results = await asyncio.gather(*audio_tasks, return_exceptions=True)
-        
+
         narration_files = []
         for i, (filename, _) in enumerate(text_mapping.items()):
             audio_data = audio_results[i]
@@ -1085,7 +1040,6 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             else:
                 logger.error(f"[Bot Español] ❌ Chirp3 TTS failed for {filename}: {audio_data}")
 
-        # Step 4: Generate Anki vocabulary file with Spanish Wavenet TTS
         await update_progress(4, f"🎵 Generando TTS para expresiones de Anki ({level_config['wavenet_voice']})...")
         await update.message.chat.send_action(action="record_voice")
 
@@ -1094,28 +1048,24 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await update_progress(4, f"🎵 Generando TTS para Anki... ({current}/{total})")
 
         vocab_filename, vocab_content, audio_files = await create_vocabulary_file_with_tts(
-            content['collocations'], 
-            safe_topic, 
+            content['collocations'],
+            safe_topic,
             level_config,
             progress_callback=vocab_progress
         )
-        
+
         if not audio_files:
             logger.error(f"[Bot Español] No Anki audio files generated!")
             await update.message.reply_text("⚠️ Advertencia: No se pudo generar TTS para las tarjetas de Anki.")
         else:
             logger.info(f"[Bot Español] ✅ Generated {len(audio_files)} Anki TTS files for level {level}")
 
-        # Step 5: Create ZIP package
         await update_progress(5, "📦 Creando paquete ZIP...")
         zip_filename, zip_buffer = create_zip_package(
             vocab_filename, vocab_content, audio_files, html_filename, html_content, topic, timestamp
         )
         logger.info(f"[Bot Español] ZIP package created: {zip_filename}")
 
-        # === Send files in order ===
-        
-        # 1. Send HTML document
         html_file = BytesIO(html_content.encode('utf-8'))
         html_file.name = html_filename
         await update.message.reply_document(
@@ -1125,13 +1075,11 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         logger.info(f"[Bot Español] Sent HTML document")
 
-        # 2. Instructional message
         await update.message.reply_text(
             f"👆 Puedes escuchar los textos del documento reproduciendo el audio a continuación 👇\n"
             f"🎧 Velocidad: {int(level_config['speaking_rate']*100)}%"
         )
 
-        # 3. Send narration audio files (Spanish Chirp3)
         if narration_files:
             for filename, audio_buffer in narration_files:
                 await update.message.reply_audio(audio=audio_buffer, filename=filename)
@@ -1139,16 +1087,13 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         else:
             await update.message.reply_text("⚠️ No se pudo generar el audio de narración.")
 
-        # 4. Emoji separator
         await update.message.reply_text("••• 💭 •••")
 
-        # 5. Anki instructions in Spanish
         await update.message.reply_text(
             "📇 Si usas Anki, importa el documento de texto a continuación en Anki, "
             "y coloca los archivos de audio de la carpeta ZIP en tu carpeta `collection.media` de Anki."
         )
 
-        # 6. Send Anki .txt file
         anki_file = BytesIO(vocab_content.encode('utf-8'))
         anki_file.name = f"importar_anki_{level}.txt"
         await update.message.reply_document(
@@ -1157,7 +1102,6 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         logger.info(f"[Bot Español] Sent Anki import file")
 
-        # 7. Send ZIP package
         zip_file_obj = BytesIO(zip_buffer.getvalue())
         zip_file_obj.name = zip_filename
         await update.message.reply_document(
@@ -1165,8 +1109,7 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             filename=zip_filename
         )
         logger.info(f"[Bot Español] Sent ZIP package")
-        
-        # Final summary in Spanish
+
         file_size = zip_buffer.getbuffer().nbytes
         logger.info(f"[Bot Español] ✅ Successfully completed request for user {user_id}, level {level}")
         await update.message.reply_text(
@@ -1179,12 +1122,12 @@ async def handle_level_input(update: Update, context: ContextTypes.DEFAULT_TYPE)
             f"• Velocidad de audio: {int(level_config['speaking_rate']*100)}%\n"
             f"• Tamaño ZIP: {file_size / 1024 / 1024:.2f}MB"
         )
-        
+
     except Exception as e:
         error_msg = f"❌ Error inesperado: {str(e)[:200]}"
         logger.error(f"[Bot Español] ERROR for user {user_id}, level {level}: {type(e).__name__}: {str(e)}", exc_info=True)
         await update.message.reply_text(error_msg)
-    
+
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1222,9 +1165,9 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Handle /help command - SPANISH VERSION"""
     user_id = update.effective_user.id
     reset_time = rate_limiter.get_reset_time(user_id)
-    
+
     level_descriptions = "\n".join([f"• {level} - {config['description']}" for level, config in LEVEL_CONFIGS.items()])
-    
+
     help_text = (
         "📖 **Cómo Usar:**\n\n"
         "1. Envíame un tema (máx 100 caracteres)\n"
@@ -1242,10 +1185,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "⚡ **Límite de Tasa:** 5 solicitudes/hora\n"
         "🇪🇸 **Idioma:** Español"
     )
-    
+
     if reset_time > 0:
         help_text += f"\n⏱️ Se restablece en {reset_time // 60} min"
-    
+
     await update.message.reply_text(help_text, parse_mode='Markdown')
     return ConversationHandler.END
 
@@ -1265,10 +1208,9 @@ if __name__ == "__main__":
         logger.info(f"  - {level}: {level_config['description']} (velocidad: {int(level_config['speaking_rate']*100)}%, voz: {level_config['wavenet_voice']})")
     logger.info(f"Límite de tasa: {config.RATE_LIMIT_REQUESTS} solicitudes por {config.RATE_LIMIT_WINDOW}s")
     logger.info("=" * 60)
-    
+
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-    
-    # Create conversation handler
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler('start', start)],
         states={
@@ -1277,10 +1219,10 @@ if __name__ == "__main__":
         },
         fallbacks=[CommandHandler('cancel', cancel)],
     )
-    
+
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_direct_message))
-    
+
     logger.info("✅ El bot está ejecutándose y listo para aceptar mensajes...")
     application.run_polling()
